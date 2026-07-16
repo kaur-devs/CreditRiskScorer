@@ -1,6 +1,8 @@
 import logging
 import pandas as pd
+from pathlib import Path
 from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
 from src.config import (
     PROCESSED_DATA_DIR,
     PROCESSED_TRAIN_PATH,
@@ -10,6 +12,8 @@ from src.config import (
     RANDOM_STATE,
     setup_logging
 )
+from src.feature_engineering import build_feature_pipeline
+from src.evaluate import evaluate_predictions
 
 logger = logging.getLogger(__name__)
 
@@ -43,15 +47,57 @@ def split_and_save_data() -> None:
     logger.info("Successfully saved stratified train, validation, and test splits.")
 
 
+def train_baseline_model() -> None:
+    logger.info("Loading split datasets for baseline training...")
+    train_df = pd.read_csv(PROCESSED_TRAIN_PATH, index_col=0)
+    val_df = pd.read_csv(PROCESSED_VAL_PATH, index_col=0)
+    
+    X_train = train_df.drop(columns=[TARGET_COLUMN])
+    y_train = train_df[TARGET_COLUMN]
+    X_val = val_df.drop(columns=[TARGET_COLUMN])
+    y_val = val_df[TARGET_COLUMN]
+    
+    pipeline = build_feature_pipeline()
+    X_train_trans = pipeline.fit_transform(X_train, y_train)
+    X_val_trans = pipeline.transform(X_val)
+    
+    logger.info("Training baseline Logistic Regression model...")
+    model = LogisticRegression(random_state=RANDOM_STATE, max_iter=1000)
+    model.fit(X_train_trans, y_train)
+    
+    y_pred = model.predict(X_val_trans)
+    y_prob = model.predict_proba(X_val_trans)[:, 1]
+    
+    plot_dir = Path("notebooks/plots")
+    metrics = evaluate_predictions(
+        y_true=y_val,
+        y_pred=y_pred,
+        y_prob=y_prob,
+        model_name="Baseline Logistic Regression",
+        plot_dir=plot_dir
+    )
+    
+    # Explain why accuracy is misleading
+    logger.info("\n--- ANALYSIS: Why Accuracy is Misleading ---")
+    logger.info(f"Baseline Accuracy: {metrics['accuracy']:.4f}")
+    
+    # Calculate zero-rate classifier (always predicts negative class 0)
+    majority_class_ratio = (y_val == 0).mean()
+    logger.info(f"Majority Class Ratio (Zero-Rate Accuracy): {majority_class_ratio:.4f}")
+    
+    logger.info(
+        "A dummy model that predicts zero default for every borrower achieves "
+        f"{majority_class_ratio*100:.2f}% accuracy. However, this model finds "
+        f"0 of the {y_val.sum()} default cases (Recall = 0.0). "
+        "Thus, high accuracy is purely a reflection of class imbalance, not predictive value."
+    )
+
+
 if __name__ == "__main__":
     setup_logging()
-    split_and_save_data()
     
-    # Verification print
-    for name, path in [("Train", PROCESSED_TRAIN_PATH), ("Val", PROCESSED_VAL_PATH), ("Test", PROCESSED_TEST_PATH)]:
-        df_split = pd.read_csv(path, index_col=0)
-        target_counts = df_split[TARGET_COLUMN].value_counts().to_dict()
-        target_pct = (df_split[TARGET_COLUMN].value_counts(normalize=True) * 100).to_dict()
-        print(f"\n{name} Split ({df_split.shape[0]} rows):")
-        for cls, count in target_counts.items():
-            print(f" - Class {cls}: {count} ({target_pct[cls]:.2f}%)")
+    # Ensure splits exist, if not, generate them
+    if not PROCESSED_TRAIN_PATH.exists():
+        split_and_save_data()
+        
+    train_baseline_model()
