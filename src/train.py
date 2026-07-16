@@ -1,8 +1,11 @@
 import logging
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+from sklearn.metrics import f1_score, precision_recall_curve
 from src.config import (
     PROCESSED_DATA_DIR,
     PROCESSED_TRAIN_PATH,
@@ -36,10 +39,6 @@ def split_and_save_data() -> None:
         stratify=temp_df[TARGET_COLUMN]
     )
     
-    logger.info(f"Train set: {train_df.shape}")
-    logger.info(f"Val set: {val_df.shape}")
-    logger.info(f"Test set: {test_df.shape}")
-    
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
     train_df.to_csv(PROCESSED_TRAIN_PATH)
     val_df.to_csv(PROCESSED_VAL_PATH)
@@ -47,8 +46,7 @@ def split_and_save_data() -> None:
     logger.info("Successfully saved stratified train, validation, and test splits.")
 
 
-def train_baseline_model() -> None:
-    logger.info("Loading split datasets for baseline training...")
+def get_preprocessed_splits():
     train_df = pd.read_csv(PROCESSED_TRAIN_PATH, index_col=0)
     val_df = pd.read_csv(PROCESSED_VAL_PATH, index_col=0)
     
@@ -61,6 +59,12 @@ def train_baseline_model() -> None:
     X_train_trans = pipeline.fit_transform(X_train, y_train)
     X_val_trans = pipeline.transform(X_val)
     
+    return X_train_trans, y_train, X_val_trans, y_val
+
+
+def train_baseline_model() -> None:
+    X_train_trans, y_train, X_val_trans, y_val = get_preprocessed_splits()
+    
     logger.info("Training baseline Logistic Regression model...")
     model = LogisticRegression(random_state=RANDOM_STATE, max_iter=1000)
     model.fit(X_train_trans, y_train)
@@ -69,35 +73,77 @@ def train_baseline_model() -> None:
     y_prob = model.predict_proba(X_val_trans)[:, 1]
     
     plot_dir = Path("notebooks/plots")
-    metrics = evaluate_predictions(
-        y_true=y_val,
-        y_pred=y_pred,
-        y_prob=y_prob,
-        model_name="Baseline Logistic Regression",
-        plot_dir=plot_dir
-    )
+    metrics = evaluate_predictions(y_val, y_pred, y_prob, "Baseline Logistic Regression", plot_dir)
+
+
+def compare_imbalance_handling() -> None:
+    logger.info("Starting class imbalance comparison experiments...")
+    X_train, y_train, X_val, y_val = get_preprocessed_splits()
+    plot_dir = Path("notebooks/plots")
     
-    # Explain why accuracy is misleading
-    logger.info("\n--- ANALYSIS: Why Accuracy is Misleading ---")
-    logger.info(f"Baseline Accuracy: {metrics['accuracy']:.4f}")
+    results = {}
     
-    # Calculate zero-rate classifier (always predicts negative class 0)
-    majority_class_ratio = (y_val == 0).mean()
-    logger.info(f"Majority Class Ratio (Zero-Rate Accuracy): {majority_class_ratio:.4f}")
+    # 1. Baseline Model (for reference)
+    model_base = LogisticRegression(random_state=RANDOM_STATE, max_iter=1000)
+    model_base.fit(X_train, y_train)
+    y_pred_base = model_base.predict(X_val)
+    y_prob_base = model_base.predict_proba(X_val)[:, 1]
+    results["Baseline"] = evaluate_predictions(y_val, y_pred_base, y_prob_base, "Baseline", plot_dir)
     
-    logger.info(
-        "A dummy model that predicts zero default for every borrower achieves "
-        f"{majority_class_ratio*100:.2f}% accuracy. However, this model finds "
-        f"0 of the {y_val.sum()} default cases (Recall = 0.0). "
-        "Thus, high accuracy is purely a reflection of class imbalance, not predictive value."
-    )
+    # 2. SMOTE
+    logger.info("Training with SMOTE...")
+    smote = SMOTE(random_state=RANDOM_STATE)
+    X_train_smote, y_train_smote = smote.fit_resample(X_train, y_train)
+    model_smote = LogisticRegression(random_state=RANDOM_STATE, max_iter=1000)
+    model_smote.fit(X_train_smote, y_train_smote)
+    y_pred_sm = model_smote.predict(X_val)
+    y_prob_sm = model_smote.predict_proba(X_val)[:, 1]
+    results["SMOTE"] = evaluate_predictions(y_val, y_pred_sm, y_prob_sm, "SMOTE", plot_dir)
+    
+    # 3. Random Oversampling (ROS)
+    logger.info("Training with Random Oversampling...")
+    ros = RandomOverSampler(random_state=RANDOM_STATE)
+    X_train_ros, y_train_ros = ros.fit_resample(X_train, y_train)
+    model_ros = LogisticRegression(random_state=RANDOM_STATE, max_iter=1000)
+    model_ros.fit(X_train_ros, y_train_ros)
+    y_pred_ros = model_ros.predict(X_val)
+    y_prob_ros = model_ros.predict_proba(X_val)[:, 1]
+    results["Random Oversampling"] = evaluate_predictions(y_val, y_pred_ros, y_prob_ros, "Random Oversampling", plot_dir)
+    
+    # 4. Class Weights (Balanced)
+    logger.info("Training with Class Weights...")
+    model_cw = LogisticRegression(random_state=RANDOM_STATE, class_weight="balanced", max_iter=1000)
+    model_cw.fit(X_train, y_train)
+    y_pred_cw = model_cw.predict(X_val)
+    y_prob_cw = model_cw.predict_proba(X_val)[:, 1]
+    results["Class Weights"] = evaluate_predictions(y_val, y_pred_cw, y_prob_cw, "Class Weights", plot_dir)
+    
+    # 5. Threshold Tuning (Using Baseline Model)
+    logger.info("Tuning decision threshold on baseline probabilities...")
+    precisions, recalls, thresholds = precision_recall_curve(y_val, y_prob_base)
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
+    best_idx = np.argmax(f1_scores)
+    best_threshold = thresholds[best_idx]
+    logger.info(f"Optimal Threshold found: {best_threshold:.4f} with Validation F1: {f1_scores[best_idx]:.4f}")
+    
+    y_pred_tuned = (y_prob_base >= best_threshold).astype(int)
+    results["Threshold Tuning"] = evaluate_predictions(y_val, y_pred_tuned, y_prob_base, "Threshold Tuning", plot_dir)
+    
+    # Generate Comparison Console Table
+    print("\n" + "="*70)
+    print("             CLASS IMBALANCE COMPARISON RESULTS")
+    print("="*70)
+    print(f"{'Method':<25} | {'Accuracy':<8} | {'Precision':<9} | {'Recall':<6} | {'F1-Score':<8} | {'ROC-AUC':<7}")
+    print("-"*70)
+    for method, metrics in results.items():
+        print(f"{method:<25} | {metrics['accuracy']:<8.4f} | {metrics['precision']:<9.4f} | {metrics['recall']:<6.4f} | {metrics['f1']:<8.4f} | {metrics['roc_auc']:<7.4f}")
+    print("="*70 + "\n")
 
 
 if __name__ == "__main__":
     setup_logging()
     
-    # Ensure splits exist, if not, generate them
     if not PROCESSED_TRAIN_PATH.exists():
         split_and_save_data()
         
-    train_baseline_model()
+    compare_imbalance_handling()
